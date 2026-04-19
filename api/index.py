@@ -1,103 +1,94 @@
-import os
+from flask import Flask, request, Response, jsonify
+from urllib.parse import urlparse
 import requests
-from flask import Flask, request, Response
-from urllib.parse import urlparse, urlunparse
+import re
 
 app = Flask(__name__)
 
-TARGET_URL = "http://www.google.com"
+# هدف را به وب تلگرام تغییر می‌دهیم
+TARGET_URL = "https://web.telegram.org/k/"
 
-@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD', 'TRACE'])
-@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD', 'TRACE'])
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 def proxy(path):
     try:
-        # ساخت URL کامل مقصد با ترکیب TARGET_URL و path دریافتی
-        # request.url شامل کل URL است، اما ما فقط به بخش path و query نیاز داریم
-        # برای این کار، query string را به صورت دستی به path اضافه می‌کنیم اگر وجود داشته باشد
-        full_url_from_request = request.url
-        parsed_request_url = urlparse(full_url_from_request)
+        # تجزیه URL هدف برای استخراج هاست
+        target_url_parsed = urlparse(TARGET_URL)
+        target_host = target_url_parsed.netloc # 'web.telegram.org'
 
-        # اگر مسیر خالی است، از TARGET_URL استفاده کن
-        if path == "" and not parsed_request_url.query:
-            req_url = TARGET_URL
-        else:
-            # ترکیب TARGET_URL با path و query string از درخواست اصلی
-            # اطمینان حاصل کنید که query string به صورت صحیح اضافه می‌شود
-            query_string = parsed_request_url.query
-            base_target_url = TARGET_URL.rstrip('/')
+        # ساخت URL کامل مقصد
+        # اگر path خالی باشد (یعنی درخواست اصلی به '/' باشد)، از TARGET_URL استفاده می‌کنیم
+        # اگر path وجود داشته باشد، آن را به انتهای TARGET_URL اضافه می‌کنیم
+        full_target_url = f"{TARGET_URL.rstrip('/')}/{path}" if path else TARGET_URL.rstrip('/')
 
-            if path:
-                 # اگر path وجود دارد، آن را به base_target_url اضافه کن
-                req_url_parts = list(urlparse(base_target_url))
-                req_url_parts[2] = f"{req_url_parts[2].rstrip('/')}/{path.lstrip('/')}" # path part
-                
-                # اضافه کردن query string اگر وجود دارد
-                if query_string:
-                    req_url_parts[4] = query_string # query part
-                
-                req_url = urlunparse(req_url_parts)
-
-            elif query_string:
-                 # اگر path خالی است ولی query string وجود دارد (مثلا درخواست ریشه با query)
-                 req_url_parts = list(urlparse(base_target_url))
-                 req_url_parts[4] = query_string
-                 req_url = urlunparse(req_url_parts)
-            else:
-                 # اگر هم path و هم query خالی بودند
-                 req_url = base_target_url
-
-
-        # اطمینان حاصل کنید که req_url معتبر است (مثلا http://www.google.com)
-        if not req_url.startswith(('http://', 'https://')):
-             # اگر TARGET_URL هم schema نداشت، یک پیش‌فرض اضافه کن
-             req_url = f"http://{req_url}"
-             
-        # اگر TARGET_URL فقط "www.google.com" بود و schema نداشت، حالا اضافه شده است
-        # اگر TARGET_URL کامل بود (مثلا "http://www.google.com")، این خط تاثیری ندارد
-
-
+        # دریافت هدرهای درخواست اصلی
         headers = {}
-        for header, value in request.headers.items():
-            if header.lower() not in ['host', 'x-forwarded-for', 'x-real-ip', 'connection',
-                                     'x-vercel-id', 'x-vercel-proxy-reason', 'x-vercel-cache-tag']:
-                headers[header] = value
+        for key, value in request.headers.items():
+            # فیلتر کردن هدرهای ناخواسته برای درخواست به سرور مقصد
+            # هدر Host توسط requests به درستی مدیریت می‌شود
+            # هدرهای مربوط به اطلاعات پراکسی و اتصال را حذف می‌کنیم
+            if key not in ['Host', 'X-Forwarded-For', 'X-Forwarded-Proto', 'X-Real-IP', 'Connection', 'Upgrade', 'Content-Length', 'Transfer-Encoding', 'Sec-WebSocket-Key', 'Sec-WebSocket-Version', 'Sec-WebSocket-Accept', 'Sec-WebSocket-Extensions']:
+                 headers[key] = value
 
-        # مهم: هدر Host را بر اساس URL هدف تنظیم کنید
-        parsed_target = urlparse(req_url)
-        headers['Host'] = parsed_target.netloc if parsed_target.netloc else 'www.google.com'
+        # تنظیم هدر Host برای سرور مقصد (وب تلگرام)
+        headers['Host'] = target_host
 
+        # آماده‌سازی URL برای ارسال با requests
+        # اطمینان حاصل می‌کنیم که query string اصلی حفظ شود
+        request_url_parsed = urlparse(request.url)
+        query_string = request.query_string.decode('utf-8')
 
-        resp = requests.request(
+        # بازسازی URL کامل برای ارسال به تلگرام
+        # از URL هدف به عنوان مبنا استفاده می‌کنیم تا scheme و netloc درست باشند
+        url_to_fetch = urlparse(TARGET_URL).scheme + "://" + target_host + request_url_parsed.path
+        if query_string:
+             url_to_fetch += "?" + query_string
+
+        # استفاده از requests برای ارسال درخواست به سرور مقصد
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # درخواست به وب تلگرام
+        resp = session.request(
             method=request.method,
-            url=req_url,
-            headers=headers,
+            url=url_to_fetch,
             data=request.get_data(),
             cookies=request.cookies,
-            allow_redirects=False
+            stream=True, # برای مدیریت بهتر پاسخ‌های بزرگ یا استریم
+            allow_redirects=False # مدیریت دستی ریدایرکت‌ها در صورت نیاز
         )
 
+        # آماده‌سازی هدرهای پاسخ برای ارسال به کلاینت
         response_headers = {}
         for key, value in resp.headers.items():
-            if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection', 'content-security-policy', 'strict-transport-security']:
+            # فیلتر کردن هدرهایی که نباید به کلاینت برگردند
+            if key not in ['Content-Encoding', 'Transfer-Encoding', 'Connection', 'Content-Length', 'Set-Cookie']: # Set-Cookie را باید مدیریت کنیم
                 response_headers[key] = value
 
-        response = Response(resp.content, resp.status_code, response_headers)
-        return response
+        # مدیریت کوکی‌ها: اگر سرور مقصد کوکی تنظیم کند، باید به کلاینت برگردانیم
+        if 'Set-Cookie' in resp.headers:
+             response_headers['Set-Cookie'] = resp.headers['Set-Cookie']
 
-    except requests.exceptions.MissingSchema:
-        return Response("Invalid URL: Missing schema (http:// or https://)", status=400)
-    except requests.exceptions.InvalidURL:
-        return Response("Invalid URL provided.", status=400)
-    except requests.exceptions.ConnectionError:
-        return Response("Connection Error: Could not connect to the target server.", status=503)
-    except requests.exceptions.Timeout:
-        return Response("Request Timed Out.", status=504)
+
+        # ایجاد یک پاسخ جریانی (streaming response)
+        def generate():
+            # در صورت نیاز به مدیریت بهتر استریم، می‌توان این بخش را پیچیده‌تر کرد
+            # فعلا کل محتوا را یکجا برمی‌گردانیم
+            yield resp.content
+
+        # بازگرداندن پاسخ به کلاینت با وضعیت و هدرهای مناسب
+        return Response(generate(), status=resp.status_code, headers=response_headers)
+
     except requests.exceptions.RequestException as e:
-        return Response(f"An error occurred during the request: {str(e)}", status=500)
+        app.logger.error(f"Request to target URL {TARGET_URL} failed: {e}")
+        # در صورت بروز خطا در اتصال به تلگرام، پاسخ مناسب برمی‌گردانیم
+        return jsonify({"error": "Failed to connect to the target server (Telegram Web)", "details": str(e)}), 503
     except Exception as e:
-        # برای خطاهای پیش‌بینی نشده دیگر، خطای دقیق را نمایش می‌دهیم
-        return Response(f"An unexpected error occurred: {str(e)}", status=500)
+        app.logger.error(f"An unexpected error occurred: {e}")
+        # مدیریت خطاهای پیش‌بینی نشده
+        return jsonify({"error": "An internal server error occurred", "details": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    # این بلاک برای اجرای محلی است. Vercel خودش سرور را مدیریت می‌کند.
+    # برای تست محلی: flask run --host=0.0.0.0
+    pass
